@@ -1,0 +1,277 @@
+{
+  "name": "Restaurant Finder and Caller (Advanced)",
+  "nodes": [
+    {
+      "parameters": {
+        "options": {}
+      },
+      "id": "node-01",
+      "name": "When chat message received",
+      "type": "@n8n/n8n-nodes-langchain.chatTrigger",
+      "typeVersion": 1.1,
+      "position": [240, 300],
+      "webhookId": "restaurant-finder-v2"
+    },
+    {
+      "parameters": {
+        "url": "http://ip-api.com/json/",
+        "options": {
+          "timeout": 5000,
+          "lowercaseHeaders": false
+        }
+      },
+      "id": "node-02",
+      "name": "Get Location from IP",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [460, 300],
+      "continueOnFail": true,
+      "notes": "Free, no auth required. Returns city/region based on the n8n server IP. Works perfectly for local deployments."
+    },
+    {
+      "parameters": {
+        "jsCode": "// Build a location-aware search query\nconst chatInput = $('When chat message received').item.json.chatInput || '';\nconst ipData = $json || {};\n\n// Build location string from IP geolocation\nlet locationStr = 'current location';\nif (ipData.status === 'success' && ipData.city) {\n  locationStr = `${ipData.city}, ${ipData.regionName || ''}, ${ipData.country || ''}`.trim();\n}\n\n// Check if user already specified a location in the query — avoid doubling up\nconst mentionsLocation = /\\b(in|near|around|at|within)\\s+[A-Z][a-zA-Z\\s]{2,}/i.test(chatInput);\n\nconst searchQuery = mentionsLocation\n  ? `${chatInput} phone number contact reservation`\n  : `${chatInput} in ${locationStr} phone number contact reservation`;\n\nreturn [{\n  json: {\n    searchQuery,\n    locationStr,\n    originalQuery: chatInput\n  }\n}];"
+      },
+      "id": "node-03",
+      "name": "Build Search Query",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [680, 300]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.firecrawl.dev/v1/search",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ query: $json.searchQuery, limit: 8, scrapeOptions: { formats: ['markdown'] } }) }}"
+      },
+      "id": "node-04",
+      "name": "Firecrawl Search",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [900, 300],
+      "continueOnFail": true,
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "firecrawl-api",
+          "name": "Firecrawl API"
+        }
+      },
+      "notes": "Credential: HTTP Header Auth — Header Name: Authorization, Value: Bearer <FIRECRAWL_KEY>"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Validate Firecrawl response and consolidate content for LLM extraction\nconst res = $json;\n\nif (res.error || !res.data || !Array.isArray(res.data)) {\n  throw new Error(`Firecrawl failed: ${JSON.stringify(res.error || 'No data returned. Check your Firecrawl API key.')}`);\n}\n\nif (res.data.length === 0) {\n  throw new Error(`No search results found for: \"${$('Build Search Query').item.json.searchQuery}\". Try a different query.`);\n}\n\n// Concatenate all returned content for the LLM to process\nconst combinedContent = res.data\n  .map(r => `SOURCE: ${r.title || 'N/A'}\\nURL: ${r.url || 'N/A'}\\nCONTENT:\\n${r.markdown || r.description || ''}\\n---`)\n  .join('\\n\\n');\n\nreturn [{\n  json: {\n    combinedContent,\n    resultCount: res.data.length,\n    searchQuery: $('Build Search Query').item.json.searchQuery,\n    locationStr: $('Build Search Query').item.json.locationStr,\n    originalQuery: $('Build Search Query').item.json.originalQuery\n  }\n}];"
+      },
+      "id": "node-05",
+      "name": "Validate Search Results",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1120, 300]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.openai.com/v1/chat/completions",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ model: 'gpt-4o-mini', messages: [{ role: 'system', content: 'You are a data extraction assistant. From the web content below, extract restaurant names, phone numbers, and addresses. Return ONLY a raw JSON object — no markdown, no explanation. Format: {\"restaurants\": [{\"name\": \"Restaurant Name\", \"phone\": \"+1XXXXXXXXXX\", \"address\": \"Full address or empty string\"}]}. Rules: (1) Only include restaurants with a real, dialable phone number. (2) Normalize all phone numbers to E.164 format (e.g. +12025551234). (3) Skip entries without a valid US phone number. (4) Do not duplicate entries. (5) Prefer restaurant-specific numbers, not directory aggregators.' }, { role: 'user', content: $json.combinedContent }], response_format: { type: 'json_object' }, temperature: 0 }) }}"
+      },
+      "id": "node-06",
+      "name": "Extract Phone Numbers",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [1340, 300],
+      "continueOnFail": true,
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "openai-api",
+          "name": "OpenAI API"
+        }
+      },
+      "notes": "Credential: HTTP Header Auth — Header Name: Authorization, Value: Bearer <OPENAI_KEY>"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Parse OpenAI output, validate E.164 phone numbers, and deduplicate\nconst raw = $json?.choices?.[0]?.message?.content;\n\nif (!raw) {\n  const errDetail = $json?.error?.message || JSON.stringify($json);\n  throw new Error(`OpenAI extraction failed: ${errDetail}`);\n}\n\nlet parsed;\ntry {\n  parsed = JSON.parse(raw);\n} catch (e) {\n  throw new Error(`Failed to parse OpenAI JSON: ${raw.substring(0, 200)}`);\n}\n\nconst restaurants = parsed.restaurants || [];\n\nif (restaurants.length === 0) {\n  throw new Error('OpenAI found no restaurants in the search results. Try a more specific query.');\n}\n\nconst e164Regex = /^\\+[1-9]\\d{6,14}$/;\nconst seenPhones = new Set();\nconst valid = [];\n\nfor (const r of restaurants) {\n  const phone = (r.phone || '').replace(/\\s/g, '').trim();\n  if (!e164Regex.test(phone)) {\n    console.log(`Skipped invalid phone for ${r.name}: ${phone}`);\n    continue;\n  }\n  if (seenPhones.has(phone)) {\n    console.log(`Skipped duplicate phone: ${phone}`);\n    continue;\n  }\n  seenPhones.add(phone);\n  valid.push({\n    name: (r.name || 'Unknown Restaurant').trim(),\n    phone,\n    address: (r.address || '').trim()\n  });\n}\n\nif (valid.length === 0) {\n  throw new Error(`No valid E.164 phone numbers found. Raw extraction: ${raw.substring(0, 300)}`);\n}\n\nconst meta = {\n  originalQuery: $('Build Search Query').item.json.originalQuery,\n  locationStr: $('Build Search Query').item.json.locationStr\n};\n\nreturn valid.map(r => ({ json: { ...r, ...meta } }));"
+      },
+      "id": "node-07",
+      "name": "Parse and Validate Phones",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1560, 300]
+    },
+    {
+      "parameters": {
+        "resume": "timeInterval",
+        "value": 2,
+        "unit": "seconds"
+      },
+      "id": "node-08",
+      "name": "Throttle Between Calls",
+      "type": "n8n-nodes-base.wait",
+      "typeVersion": 1.1,
+      "position": [1780, 300],
+      "webhookId": "throttle-restaurant-calls",
+      "notes": "2-second gap between calls to avoid hammering ElevenLabs/Twilio. Increase if you see rate limit errors."
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.elevenlabs.io/v1/convai/twilio/outbound-call",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ agent_id: $vars.ELEVENLABS_AGENT_ID, to_number: $json.phone, from_number: $vars.TWILIO_FROM_NUMBER, conversation_initiation_client_data: { dynamic_variables: { restaurant_name: $json.name, restaurant_address: $json.address, user_query: $json.originalQuery } } }) }}"
+      },
+      "id": "node-09",
+      "name": "ElevenLabs Outbound Call",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [2000, 300],
+      "continueOnFail": true,
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "elevenlabs-api",
+          "name": "ElevenLabs API"
+        }
+      },
+      "notes": "Credential: HTTP Header Auth — Header Name: xi-api-key, Value: <ELEVENLABS_KEY>. Variables needed: ELEVENLABS_AGENT_ID, TWILIO_FROM_NUMBER."
+    },
+    {
+      "parameters": {
+        "jsCode": "// Normalise the ElevenLabs response — handles both success and API errors gracefully\nconst callResponse = $json;\nconst restaurantData = $('Throttle Between Calls').item.json;\n\nconst callId =\n  callResponse.call_id ||\n  callResponse.id ||\n  callResponse.callSid ||\n  callResponse.conversation_id ||\n  null;\n\nconst hasError =\n  callResponse.detail !== undefined ||\n  callResponse.error !== undefined ||\n  (callResponse.status >= 400);\n\nconst isSuccess = !hasError && callId !== null;\n\nlet errorMsg = null;\nif (!isSuccess) {\n  errorMsg =\n    callResponse.detail ||\n    callResponse.error?.message ||\n    JSON.stringify(callResponse).substring(0, 200);\n}\n\nreturn [{\n  json: {\n    restaurantName: restaurantData.name || 'Unknown',\n    phone: restaurantData.phone || 'Unknown',\n    address: restaurantData.address || '',\n    callId: callId || 'N/A',\n    status: isSuccess ? 'initiated' : 'failed',\n    error: errorMsg,\n    timestamp: new Date().toISOString(),\n    locationStr: restaurantData.locationStr || '',\n    originalQuery: restaurantData.originalQuery || ''\n  }\n}];"
+      },
+      "id": "node-10",
+      "name": "Format Call Result",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [2220, 300]
+    },
+    {
+      "parameters": {
+        "operation": "append",
+        "documentId": {
+          "__rl": true,
+          "value": "={{ $vars.GOOGLE_SHEETS_ID }}",
+          "mode": "id"
+        },
+        "sheetName": {
+          "__rl": true,
+          "value": "Calls Log",
+          "mode": "name"
+        },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "Timestamp": "={{ $json.timestamp }}",
+            "Query": "={{ $json.originalQuery }}",
+            "Location": "={{ $json.locationStr }}",
+            "Restaurant": "={{ $json.restaurantName }}",
+            "Phone": "={{ $json.phone }}",
+            "Address": "={{ $json.address }}",
+            "Call ID": "={{ $json.callId }}",
+            "Status": "={{ $json.status }}",
+            "Error": "={{ $json.error || '' }}"
+          },
+          "matchingColumns": [],
+          "schema": [
+            { "id": "Timestamp", "displayName": "Timestamp", "required": false, "type": "string" },
+            { "id": "Query", "displayName": "Query", "required": false, "type": "string" },
+            { "id": "Location", "displayName": "Location", "required": false, "type": "string" },
+            { "id": "Restaurant", "displayName": "Restaurant", "required": false, "type": "string" },
+            { "id": "Phone", "displayName": "Phone", "required": false, "type": "string" },
+            { "id": "Address", "displayName": "Address", "required": false, "type": "string" },
+            { "id": "Call ID", "displayName": "Call ID", "required": false, "type": "string" },
+            { "id": "Status", "displayName": "Status", "required": false, "type": "string" },
+            { "id": "Error", "displayName": "Error", "required": false, "type": "string" }
+          ]
+        },
+        "options": {}
+      },
+      "id": "node-11",
+      "name": "Log to Google Sheets",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.4,
+      "position": [2440, 300],
+      "continueOnFail": true,
+      "credentials": {
+        "googleSheetsOAuth2Api": {
+          "id": "google-sheets-oauth",
+          "name": "Google Sheets OAuth2"
+        }
+      },
+      "notes": "Set n8n variable GOOGLE_SHEETS_ID to the ID from your sheet URL: /spreadsheets/d/<ID>/edit. Create a sheet tab named 'Calls Log' with matching column headers first."
+    },
+    {
+      "parameters": {
+        "aggregate": "aggregateAllItemData",
+        "destinationFieldName": "calls",
+        "options": {}
+      },
+      "id": "node-12",
+      "name": "Aggregate Results",
+      "type": "n8n-nodes-base.aggregate",
+      "typeVersion": 1,
+      "position": [2660, 300]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Build the final human-readable chat response\nconst calls = $json.calls || [];\n\nif (!calls.length) {\n  return [{ json: { output: 'No calls were made. No restaurants with valid phone numbers were found.' } }];\n}\n\nconst initiated = calls.filter(c => c.status === 'initiated');\nconst failed = calls.filter(c => c.status === 'failed');\nconst location = calls[0]?.locationStr || 'your location';\nconst query = calls[0]?.originalQuery || '';\n\nconst lines = [\n  `Search: \"${query}\" near ${location}`,\n  `Found ${calls.length} restaurant(s). Calls initiated: ${initiated.length}. Failed: ${failed.length}.`,\n  ''\n];\n\nif (initiated.length > 0) {\n  lines.push('Calls initiated:');\n  initiated.forEach(c => {\n    const addr = c.address ? ` — ${c.address}` : '';\n    lines.push(`  ${c.restaurantName}${addr}`);\n    lines.push(`    Phone: ${c.phone} | Call ID: ${c.callId}`);\n  });\n}\n\nif (failed.length > 0) {\n  lines.push('');\n  lines.push('Failed:');\n  failed.forEach(c => {\n    lines.push(`  ${c.restaurantName} (${c.phone}): ${c.error || 'Unknown error'}`);\n  });\n}\n\nlines.push('');\nlines.push('All results logged to Google Sheets.');\n\nreturn [{ json: { output: lines.join('\\n') } }];"
+      },
+      "id": "node-13",
+      "name": "Build Final Summary",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [2880, 300]
+    }
+  ],
+  "connections": {
+    "When chat message received": {
+      "main": [[{ "node": "Get Location from IP", "type": "main", "index": 0 }]]
+    },
+    "Get Location from IP": {
+      "main": [[{ "node": "Build Search Query", "type": "main", "index": 0 }]]
+    },
+    "Build Search Query": {
+      "main": [[{ "node": "Firecrawl Search", "type": "main", "index": 0 }]]
+    },
+    "Firecrawl Search": {
+      "main": [[{ "node": "Validate Search Results", "type": "main", "index": 0 }]]
+    },
+    "Validate Search Results": {
+      "main": [[{ "node": "Extract Phone Numbers", "type": "main", "index": 0 }]]
+    },
+    "Extract Phone Numbers": {
+      "main": [[{ "node": "Parse and Validate Phones", "type": "main", "index": 0 }]]
+    },
+    "Parse and Validate Phones": {
+      "main": [[{ "node": "Throttle Between Calls", "type": "main", "index": 0 }]]
+    },
+    "Throttle Between Calls": {
+      "main": [[{ "node": "ElevenLabs Outbound Call", "type": "main", "index": 0 }]]
+    },
+    "ElevenLabs Outbound Call": {
+      "main": [[{ "node": "Format Call Result", "type": "main", "index": 0 }]]
+    },
+    "Format Call Result": {
+      "main": [[{ "node": "Log to Google Sheets", "type": "main", "index": 0 }]]
+    },
+    "Log to Google Sheets": {
+      "main": [[{ "node": "Aggregate Results", "type": "main", "index": 0 }]]
+    },
+    "Aggregate Results": {
+      "main": [[{ "node": "Build Final Summary", "type": "main", "index": 0 }]]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1"
+  }
+}
